@@ -634,6 +634,7 @@ class VersionSet::Builder {
           edit->compact_pointers_[i].second.Encode().ToString();
     }
 
+    // 累加要删除的文件到对应 level 的 deleted_files 中
     // Delete files
     for (const auto& deleted_file_set_kvp : edit->deleted_files_) {
       const int level = deleted_file_set_kvp.first;
@@ -641,10 +642,15 @@ class VersionSet::Builder {
       levels_[level].deleted_files.insert(number);
     }
 
+    // 累加要新增的文件到 added_files 中
     // Add new files
     for (size_t i = 0; i < edit->new_files_.size(); i++) {
+
+      // 获取对应的层数
       const int level = edit->new_files_[i].first;
+      // 获取对应的文件元数据
       FileMetaData* f = new FileMetaData(edit->new_files_[i].second);
+      // 设置文件对应的引用数
       f->refs = 1;
 
       // We arrange to automatically compact this file after
@@ -660,9 +666,15 @@ class VersionSet::Builder {
       // same as the compaction of 40KB of data.  We are a little
       // conservative and allow approximately one seek for every 16KB
       // of data before triggering a compaction.
+      
+      // 上面注释中简单计算了一个 compaction 操作对应的开销
+      // 所以通过文件大小除以16K可以得到允许的seek次数
+      // 其实这个可以做成一个配置项
+
       f->allowed_seeks = static_cast<int>((f->file_size / 16384U));
       if (f->allowed_seeks < 100) f->allowed_seeks = 100;
 
+      // 注意要把deleted_files里面去掉这个文件number!!
       levels_[level].deleted_files.erase(f->number);
       levels_[level].added_files->insert(f);
     }
@@ -670,21 +682,33 @@ class VersionSet::Builder {
 
   // Save the current state in *v.
   void SaveTo(Version* v) {
+    // 拿到version_set_的比较器。
     BySmallestKey cmp;
     cmp.internal_comparator = &vset_->icmp_;
     for (int level = 0; level < config::kNumLevels; level++) {
       // Merge the set of added files with the set of pre-existing files.
       // Drop any deleted files.  Store the result in *v.
+      // 对于初始化OpenDB时的VersionSet::Builder来说。base_就是指向current_。
       const std::vector<FileMetaData*>& base_files = base_->files_[level];
       std::vector<FileMetaData*>::const_iterator base_iter = base_files.begin();
       std::vector<FileMetaData*>::const_iterator base_end = base_files.end();
+
+      // 这里added指向的是version_set::builder里面的levels。
       const FileSet* added_files = levels_[level].added_files;
+      // 先预留了那么多空间，实际上可能是用不到那么多的。
       v->files_[level].reserve(base_files.size() + added_files->size());
+
+      // 把 base_files 和 added 两个文件数组进行合并
       for (const auto& added_file : *added_files) {
         // Add all smaller files listed in base_
+        // 在base_files里面找到所有比added_iter小的文件。
         for (std::vector<FileMetaData*>::const_iterator bpos =
                  std::upper_bound(base_iter, base_end, added_file, cmp);
              base_iter != bpos; ++base_iter) {
+          // 尝试把base_iter加到v_->files里面。
+          // 前提是不在删除的列表里面。
+          // 注意：base_iter是不断向前走的。所以这里并不会出现一个base_iter文件
+          // 多次被添加的情况。
           MaybeAddFile(v, level, *base_iter);
         }
 
@@ -714,17 +738,26 @@ class VersionSet::Builder {
     }
   }
 
+  // 这个函数主要就是做：
+  // 看一下f是否是在要删除的列表里面
+  // 如果不在，那么添加到version v相应的level的文件列表中。
   void MaybeAddFile(Version* v, int level, FileMetaData* f) {
     if (levels_[level].deleted_files.count(f->number) > 0) {
+
+      // 如果这个文件要被删除掉，那么就不加到files_里面。
       // File is deleted: do nothing
     } else {
       std::vector<FileMetaData*>* files = &v->files_[level];
+      // level0的文件是可能存在overlap的
+      // level1~7的则不可能
       if (level > 0 && !files->empty()) {
         // Must not overlap
         assert(vset_->icmp_.Compare((*files)[files->size() - 1]->largest,
                                     f->smallest) < 0);
       }
       f->refs++;
+
+      // 添加到version v相应的level的文件列表中。
       files->push_back(f);
     }
   }
@@ -747,6 +780,8 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       descriptor_log_(nullptr),
       dummy_versions_(this),
       current_(nullptr) {
+  // 构造时，CURRENT 一开始指向了 NULL
+  // 此时 append 一个新的 Version，相应地更新 CURRENT
   AppendVersion(new Version(this));
 }
 
@@ -759,6 +794,7 @@ VersionSet::~VersionSet() {
 
 void VersionSet::AppendVersion(Version* v) {
   // Make "v" current
+  // 确保要追加的新 Version 引用计数为 0，并且不为当前 VersionSet 的 CURRENT
   assert(v->refs_ == 0);
   assert(v != current_);
   if (current_ != nullptr) {
@@ -767,6 +803,7 @@ void VersionSet::AppendVersion(Version* v) {
   current_ = v;
   v->Ref();
 
+  // 更新 VersionSet 中的 Version 双向链表
   // Append to linked list
   v->prev_ = dummy_versions_.prev_;
   v->next_ = &dummy_versions_;
@@ -860,6 +897,9 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
 }
 
 Status VersionSet::Recover(bool* save_manifest) {
+
+
+  // 创建相应的 Reporter
   struct LogReporter : public log::Reader::Reporter {
     Status* status;
     void Corruption(size_t bytes, const Status& s) override {
@@ -867,6 +907,7 @@ Status VersionSet::Recover(bool* save_manifest) {
     }
   };
 
+  // 读取 CURRENT 文件，其中记载了当前的 MAINFEST 文件名
   // Read "CURRENT" file, which contains a pointer to the current manifest file
   std::string current;
   Status s = ReadFileToString(env_, CurrentFileName(dbname_), &current);
@@ -878,8 +919,10 @@ Status VersionSet::Recover(bool* save_manifest) {
   }
   current.resize(current.size() - 1);
 
+  // 获得 MAINIFEST 文件的路径
   std::string dscname = dbname_ + "/" + current;
   SequentialFile* file;
+  // 生成新的 SequentialFile，本质是只读方式打开该文件
   s = env_->NewSequentialFile(dscname, &file);
   if (!s.ok()) {
     if (s.IsNotFound()) {
@@ -897,18 +940,29 @@ Status VersionSet::Recover(bool* save_manifest) {
   uint64_t last_sequence = 0;
   uint64_t log_number = 0;
   uint64_t prev_log_number = 0;
+
+  // 通过初始化函数的构造，current 此时指向了空的 version
+  // 所以使用 builder 在 current 的基准上此时 replay 这些 VersionEdit
   Builder builder(this, current_);
   int read_records = 0;
 
   {
     LogReporter reporter;
     reporter.status = &s;
+
+    // 读取对应的 MAINFEST，与 WAL 的处理方式相同，reader 读取 record
     log::Reader reader(file, &reporter, true /*checksum*/,
                        0 /*initial_offset*/);
+    
+    // 本质生效的数据还是 Slice record. scratch 只用于缓冲。
     Slice record;
     std::string scratch;
+
+    // 从文件中读取出一条条记录，也就是 VersionEdit
     while (reader.ReadRecord(&record, &scratch) && s.ok()) {
       ++read_records;
+
+      // 相应的将 record 重新解码成 VersionEdit
       VersionEdit edit;
       s = edit.DecodeFrom(record);
       if (s.ok()) {
@@ -920,6 +974,7 @@ Status VersionSet::Recover(bool* save_manifest) {
         }
       }
 
+      // 读取MANIFEST文件，将里面的VersionEdit读取应用到一个builder里
       if (s.ok()) {
         builder.Apply(&edit);
       }
@@ -966,10 +1021,15 @@ Status VersionSet::Recover(bool* save_manifest) {
   }
 
   if (s.ok()) {
+    // 创建一个新版本
     Version* v = new Version(this);
+    // 将builder里面的内容应用到新版本里
     builder.SaveTo(v);
     // Install recovered version
+    // 更新每个level里面的合并info
+    // 更新Size Compaction的统计信息
     Finalize(v);
+    // 安装新版本成为当前版本,把最后的version放到VersionSet里面。
     AppendVersion(v);
     manifest_file_number_ = next_file;
     next_file_number_ = next_file + 1;
@@ -979,6 +1039,10 @@ Status VersionSet::Recover(bool* save_manifest) {
 
     // See if we can reuse the existing MANIFEST file.
     if (ReuseManifest(dscname, current)) {
+        // 如果MANIFEST可以重用，那么不需要保存MANIFEST
+        // 这里主要判断MANIFEST的大小，如果大于2M，那么就不会重用MANIFEST文件，
+        // 而是将当前状态写入到一个新的MANIFEST文件里，这样可以避免打开的时候读取
+        // 太大的MANINFEST，使得打开时间太长
       // No need to save new manifest
     } else {
       *save_manifest = true;

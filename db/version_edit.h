@@ -83,6 +83,7 @@ class VersionEdit {
  private:
   friend class VersionSet;
 
+  // Level-FileNo
   typedef std::set<std::pair<int, uint64_t>> DeletedFileSet;
 
   std::string comparator_;
@@ -98,6 +99,7 @@ class VersionEdit {
 
   std::vector<std::pair<int, InternalKey>> compact_pointers_;
   DeletedFileSet deleted_files_;
+  // Level-FileMetaData
   std::vector<std::pair<int, FileMetaData>> new_files_;
 };
 

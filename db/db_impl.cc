@@ -290,22 +290,32 @@ void DBImpl::RemoveObsoleteFiles() {
 }
 
 Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
+
+  // 如果要进行操作，必须要保证锁是获得的。
   mutex_.AssertHeld();
 
   // Ignore error from CreateDir since the creation of the DB is
   // committed only when the descriptor is created, and this directory
   // may already exist from a previous failed creation attempt.
+  // 创建数据库目录
   env_->CreateDir(dbname_);
   assert(db_lock_ == nullptr);
+  // 加文件锁，防止其他进程进入
   Status s = env_->LockFile(LockFileName(dbname_), &db_lock_);
   if (!s.ok()) {
     return s;
   }
 
+  // CurrentFileName = db.dir/CURRENT
+  // 看一下这个相应的文件是否存在，然后根据情况来
+  // 看一下是否报错。
   if (!env_->FileExists(CurrentFileName(dbname_))) {
+    // 如果CURRENT文件不存在，且配置了 create_if_missing 说明需要新创建数据库
     if (options_.create_if_missing) {
       Log(options_.info_log, "Creating DB %s since it was missing.",
           dbname_.c_str());
+
+      // 新创建一个数据库
       s = NewDB();
       if (!s.ok()) {
         return s;
@@ -321,6 +331,7 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
     }
   }
 
+  // 读取MANIFEST文件进行版本信息的恢复
   s = versions_->Recover(save_manifest);
   if (!s.ok()) {
     return s;
@@ -334,25 +345,58 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   // Note that PrevLogNumber() is no longer used, but we pay
   // attention to it in case we are recovering a database
   // produced by an older version of leveldb.
+  
+  // 通过建立起来的version set可以拿到min log。
+  // 这个min log也就是当前最大的WAL LOG序号。
+  // 不是应该叫max log么？为什么叫min_log？
+  // 根据序号分发来说。这个时候min_log就是最小的可用的WAL LOG序号了。
+  // 大不了可以把新来的<key, value> append到这个文件后面。
+  // 或者是重新生成一个WAL LOG。
   const uint64_t min_log = versions_->LogNumber();
+
+  // prev log主要是记录了上次db服务正常的时候，正在用的log文件序号。
+  // 也是为了方便恢复。
   const uint64_t prev_log = versions_->PrevLogNumber();
+
+  // 这里应该是到数据库所在目录下，把这个目录里面的所有的文件都放到filenames
+  // 这个vector里面。
   std::vector<std::string> filenames;
   s = env_->GetChildren(dbname_, &filenames);
   if (!s.ok()) {
     return s;
   }
+
+  // expected列表就只会罗列文件的序号：
+  // [ 5,8,11,14,17 ]
   std::set<uint64_t> expected;
   versions_->AddLiveFiles(&expected);
   uint64_t number;
   FileType type;
+
   std::vector<uint64_t> logs;
+  // 这里面存放了所有大于等于当前版本min log的LOG序号。
+  // 此外，还会把前一个序号pre_log也保存起来。
+
+  // 遍历目录下面的所有的文件
   for (size_t i = 0; i < filenames.size(); i++) {
+
+    // 根据文件名来决定是什么样的类型。
+    // number是什么？文件名里面的数字。
+    // 如果解析失败，比如不是logFile，这个时候number = 0.
+    // ParseFileName主要功能就是根据文件名，返回类型以及序号。
+    // 除WAL LOG使用了序号。其他文件也是使用了序号。
     if (ParseFileName(filenames[i], &number, &type)) {
       expected.erase(number);
+
+      // 从列表中把日志文件找出来
+      // 并且要求number >= min_log或者说number == prev_log
+      // prev_log为0时。number == 0但是这个时候，很有可能type != logFile。
       if (type == kLogFile && ((number >= min_log) || (number == prev_log)))
         logs.push_back(number);
     }
   }
+  // 到这里，基本上logs里面存放的就是最大的xxx.ldb里面最大的数字
+  // 这个时候主要是为了保证filename和expected里面的数字是一一对应的！！
   if (!expected.empty()) {
     char buf[50];
     std::snprintf(buf, sizeof(buf), "%d missing files; e.g.",
@@ -360,9 +404,13 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
     return Status::Corruption(buf, TableFileName(dbname_, *(expected.begin())));
   }
 
+  // 逐个恢复日志的内容，排序文件号
   // Recover in the order in which the logs were generated
   std::sort(logs.begin(), logs.end());
+  // 按照数字顺序恢复
   for (size_t i = 0; i < logs.size(); i++) {
+
+    // 从日志中恢复
     s = RecoverLogFile(logs[i], (i == logs.size() - 1), save_manifest, edit,
                        &max_sequence);
     if (!s.ok()) {
@@ -372,6 +420,9 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
     // The previous incarnation may not have written any MANIFEST
     // records after allocating this log number.  So we manually
     // update the file number allocation counter in VersionSet.
+    // 因为前面已经把>= min_log的序号放到了logs里面。
+    // 所以这里需要把这些较大的序号也设置为已经被使用了。
+    // 后面在分发的时候，这些序号就不能再发出去了。
     versions_->MarkFileNumberUsed(logs[i]);
   }
 
@@ -382,6 +433,11 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   return Status::OK();
 }
 
+// logs[i]就是一个序号
+// i == logs.size() - 1 标志是不是最后一个log
+// 是否需要保存manifest
+// edit在打开DB的时候生成的一个version edit
+// 最大的seq序号
 Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
                               bool* save_manifest, VersionEdit* edit,
                               SequenceNumber* max_sequence) {
@@ -400,6 +456,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
 
   mutex_.AssertHeld();
 
+  // 这里利用给定的log_number，生成相应的xxxx.log文件名。然后打开之。
   // Open the log file
   std::string fname = LogFileName(dbname_, log_number);
   SequentialFile* file;
@@ -415,47 +472,68 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   reporter.info_log = options_.info_log;
   reporter.fname = fname.c_str();
   reporter.status = (options_.paranoid_checks ? &status : nullptr);
+
   // We intentionally make log::Reader do checksumming even if
   // paranoid_checks==false so that corruptions cause entire commits
   // to be skipped instead of propagating bad information (like overly
   // large sequence numbers).
+  // 利用打开的文件生成log Reader。这个是前面的博文介绍过的。
   log::Reader reader(file, &reporter, true /*checksum*/, 0 /*initial_offset*/);
   Log(options_.info_log, "Recovering log #%llu",
       (unsigned long long)log_number);
 
+  // 一堆后面要用的局部变量
   // Read all the records and add to a memtable
-  std::string scratch;
-  Slice record;
-  WriteBatch batch;
-  int compactions = 0;
-  MemTable* mem = nullptr;
+  std::string scratch; // 用来做缓冲区。其实没有什么特别的作用。
+  Slice record;        // log::reader在read的时候，最有用的是这个record
+  WriteBatch batch;    // 批量写。因为leveldb最终写数据库的接口都是通过这个批处理完成
+  int compactions = 0; // 合并
+  MemTable* mem = nullptr; // skiplist. 也就是memtable
+
+  // 从logReader中读出一个完整的用户输入的record.
   while (reader.ReadRecord(&record, &scratch) && status.ok()) {
+
+    // 检查格式
     if (record.size() < 12) {
+      // 输出报错信息，然后继续
       reporter.Corruption(record.size(),
                           Status::Corruption("log record too small"));
       continue;
     }
+
+    // 生成一个批处理
     WriteBatchInternal::SetContents(&batch, record);
 
+    // 如果memtable还是空的
+    // 这里生成一个新的memtable.
     if (mem == nullptr) {
       mem = new MemTable(internal_comparator_);
       mem->Ref();
     }
+
+    // 把前面生成的批处理任务放到memtable里面。
     status = WriteBatchInternal::InsertInto(&batch, mem);
     MaybeIgnoreError(&status);
     if (!status.ok()) {
       break;
     }
+
+    // 批处理操作的时候，每个item都会有相应的序号。
     const SequenceNumber last_seq = WriteBatchInternal::Sequence(&batch) +
                                     WriteBatchInternal::Count(&batch) - 1;
+    // 更新这个序号
     if (last_seq > *max_sequence) {
       *max_sequence = last_seq;
     }
 
+    // 如果写入的数据太多，要开始生成level0文件了。
     if (mem->ApproximateMemoryUsage() > options_.write_buffer_size) {
       compactions++;
       *save_manifest = true;
       status = WriteLevel0Table(mem, edit, nullptr);
+
+      // 由于这里还是在打开数据库文件。所以
+      // 这里也就不去管什么memtable. immutable.
       mem->Unref();
       mem = nullptr;
       if (!status.ok()) {
@@ -469,6 +547,10 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   delete file;
 
   // See if we should keep reusing the last log file.
+  // 如果options里面指定说要在以前旧的WAL log里面接着写。并且这个last_log就是
+  // 最后一个日志文件了。
+  // 并且是需要在没有发生过compation的情况。
+  // Q: 如果发生过compaction是不是会删除旧有的log文件。
   if (status.ok() && options_.reuse_logs && last_log && compactions == 0) {
     assert(logfile_ == nullptr);
     assert(log_ == nullptr);
@@ -490,6 +572,9 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
     }
   }
 
+  // 当log文件特别多的时候。中间的某些步骤是可能生成mem。并且最后是没有释放的。
+  // 那么这个时候，可以想办法把这些WAL LOG转换成为level 0文件。
+  // 免得后面在恢复的时候再去重新过非常多的日志文件。
   if (mem != nullptr) {
     // mem did not get reused; compact it.
     if (status.ok()) {
@@ -1483,15 +1568,23 @@ DB::~DB() = default;
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   *dbptr = nullptr;
 
+  // 创建 DB 实例
   DBImpl* impl = new DBImpl(options, dbname);
+
+  // 加锁
   impl->mutex_.Lock();
   VersionEdit edit;
   // Recover handles create_if_missing, error_if_exists
   bool save_manifest = false;
+
+  // 调用DBImpl::Recover完成MANIFEST的加载和故障恢复
   Status s = impl->Recover(&edit, &save_manifest);
   if (s.ok() && impl->mem_ == nullptr) {
+    // 创建日志和相应的MemTable，生成新的日志文件号，作为新版本
     // Create new log and a corresponding memtable.
     uint64_t new_log_number = impl->versions_->NewFileNumber();
+
+    // 创建新的日志文件
     WritableFile* lfile;
     s = options.env->NewWritableFile(LogFileName(dbname, new_log_number),
                                      &lfile);
@@ -1505,6 +1598,8 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     }
   }
   if (s.ok() && save_manifest) {
+    // 如果需要重写MANIFEST文件，那么做一个版本变更，这里面会创建一个新的MANIFEST
+    // 将当前的版本信息写入，然后将edit的内容写入。   
     edit.SetPrevLogNumber(0);  // No older logs needed after recovery.
     edit.SetLogNumber(impl->logfile_number_);
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
