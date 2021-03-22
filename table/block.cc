@@ -45,6 +45,11 @@ Block::~Block() {
   }
 }
 
+// 辅助函数，用于提取从 p 内存位置开始的entry. 也就是内容块，对应一个个 KV Entry
+// 将长度分别记录到传进来的指针里面
+// limit是不能超出的内存的长度
+// 如果遇到什么错误，就返回空指针
+//
 // Helper routine: decode the next block entry starting at "p",
 // storing the number of shared key bytes, non_shared key bytes,
 // and the length of the value in "*shared", "*non_shared", and
@@ -55,22 +60,38 @@ Block::~Block() {
 static inline const char* DecodeEntry(const char* p, const char* limit,
                                       uint32_t* shared, uint32_t* non_shared,
                                       uint32_t* value_length) {
+  // 如果剩下的已经不足三个bytes，那么肯定是没有内容或者出错了。
+  // 为什么这里写明是3 bytes?
+  // 这是因为shared key length, non-shared key length, value length 
+  // 三个长度即使是0,也会占用3 bytes
   if (limit - p < 3) return nullptr;
+  // 分别取出三个长度
   *shared = reinterpret_cast<const uint8_t*>(p)[0];
   *non_shared = reinterpret_cast<const uint8_t*>(p)[1];
   *value_length = reinterpret_cast<const uint8_t*>(p)[2];
+
+  // 如查所有的长度都是小于128的。那么在压缩编码的时候，就是直接按照
+  // 一个byte来存放。不需要解码
   if ((*shared | *non_shared | *value_length) < 128) {
     // Fast path: all three values are encoded in one byte each
     p += 3;
   } else {
+    // 否则需要针对压缩后的编码进行解码，GetVarint32Ptr
+    // 执行 GetVarint32Ptr 过程中相应地移动了指针 p
     if ((p = GetVarint32Ptr(p, limit, shared)) == nullptr) return nullptr;
     if ((p = GetVarint32Ptr(p, limit, non_shared)) == nullptr) return nullptr;
     if ((p = GetVarint32Ptr(p, limit, value_length)) == nullptr) return nullptr;
   }
 
+  // 读出来的条目的长度肯定是 non_shared_key_length + value_length
+  // 如果余下的空间没有这么多了那么肯定是出错了
   if (static_cast<uint32_t>(limit - p) < (*non_shared + *value_length)) {
     return nullptr;
   }
+  // 返回 non_shared_key + value 内容的超始点
+  // 后面在使用的时候
+  // (p, non_shared_key) 就是非共享的key的内容
+  // (p+non_shared_key, value_length) 就是value的内容
   return p;
 }
 

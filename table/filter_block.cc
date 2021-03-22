@@ -77,13 +77,25 @@ void FilterBlockBuilder::GenerateFilter() {
 FilterBlockReader::FilterBlockReader(const FilterPolicy* policy,
                                      const Slice& contents)
     : policy_(policy), data_(nullptr), offset_(nullptr), num_(0), base_lg_(0) {
+  // Filter 数据的大小
   size_t n = contents.size();
+  // 检验数据长度
   if (n < 5) return;  // 1 byte for base_lg_ and 4 for start of offset array
+  // 获取对应的 base_lg_，即 BlockContent 的最后一个字节
   base_lg_ = contents[n - 1];
+  
+  // 解析 base_lg_ 之前的四个字节，offset array offset
+  // 该偏移量指向了 filter offset 的起始地址，相对于该块的偏移字节数
   uint32_t last_word = DecodeFixed32(contents.data() + n - 5);
   if (last_word > n - 5) return;
+  
+  // Block Content 即为整个数据区0
   data_ = contents.data();
+  // data + last_word 指针指向的即为 offset array
   offset_ = data_ + last_word;
+  // 布隆过滤器个数计算：
+  // filter offset 总的字节数 = 总的字节数 - (base_lg_ + offset array offset) - last_word
+  // 每个 filter offset 为 4bytes，所以可以计算出对应的 filter 个数
   num_ = (n - 5 - last_word) / 4;
 }
 

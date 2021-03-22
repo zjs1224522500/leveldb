@@ -42,10 +42,15 @@ class BlockBuilder {
 
  private:
   const Options* options_;
+
+  // 构建 Block 时，存放数据的 buffer
   std::string buffer_;              // Destination buffer
+  // 构建 Block 时，存储的对应的 restarts 偏移量信息
   std::vector<uint32_t> restarts_;  // Restart points
+  // restart 点之间的 entry 计数器
   int counter_;                     // Number of entries emitted since restart
   bool finished_;                   // Has Finish() been called?
+  // 前缀匹配过程中，记录的上一个 Key
   std::string last_key_;
 };
 

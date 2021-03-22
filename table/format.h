@@ -22,6 +22,8 @@ struct ReadOptions;
 // block or a meta block.
 class BlockHandle {
  public:
+
+  // BlockHandle 最多占用 20 字节，因为uint64_t最多占用10字节
   // Maximum encoding length of a BlockHandle
   enum { kMaxEncodedLength = 10 + 10 };
 
@@ -39,6 +41,8 @@ class BlockHandle {
   Status DecodeFrom(Slice* input);
 
  private:
+  // 文件偏移量和 Block 大小
+  // 通过这两个数据就可以定位到文件里的某一个 Block
   uint64_t offset_;
   uint64_t size_;
 };
@@ -47,6 +51,7 @@ class BlockHandle {
 // end of every table file.
 class Footer {
  public:
+  // Footer 最多占用 20*2 + 8 = 48 字节。MagicNumber 8 字节
   // Encoded length of a Footer.  Note that the serialization of a
   // Footer will always occupy exactly this many bytes.  It consists
   // of two block handles and a magic number.
@@ -66,10 +71,14 @@ class Footer {
   Status DecodeFrom(Slice* input);
 
  private:
+  // Meta Index Block 起始块
   BlockHandle metaindex_handle_;
+  // Index Block 起始块
   BlockHandle index_handle_;
 };
 
+// 这里的 magic number 是通过 echo http://code.google.com/p/leveldb/ | sha1sum 这个命令来生成的。
+// 也就是每个sst文件的尾部都会有这个magic number。比如可以通过 hexdump 来查看sst文件的尾部。
 // kTableMagicNumber was picked by running
 //    echo http://code.google.com/p/leveldb/ | sha1sum
 // and taking the leading 64 bits.

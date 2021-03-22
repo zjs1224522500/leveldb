@@ -25,26 +25,63 @@ struct TableBuilder::Rep {
         file(f),
         offset(0),
         data_block(&options),
+        // 生成data block index -> block builder
         index_block(&index_block_options),
         num_entries(0),
         closed(false),
+        // 根据情况来看是否需要生成相应的filter policy
         filter_block(opt.filter_policy == nullptr
                          ? nullptr
                          : new FilterBlockBuilder(opt.filter_policy)),
+        // 一开始并没有pending
+        // 这个flag为true表明需要添加data block index item.
         pending_index_entry(false) {
+    // 一开始把这个restart 设置为1，即 index block 不启用前缀编码
     index_block_options.block_restart_interval = 1;
   }
 
+  // 传进来的选项
   Options options;
+
+  // data block index的选项
+  // 实际上，这里可以节省空间的。因为有用的只有一个option.
   Options index_block_options;
+
+  // 文件写出指针
   WritableFile* file;
+
+  // 当前写的 offset，即当前写到哪了
+  // 注意：这个offset初始值为0，也就是说，
+  // 它假设的是这个文件一开始的内容就是空的。
+  // 或者说根本不关心当前文件的指针位置
   uint64_t offset;
+
+  // 写的状态，之前的写入是否出错了？ 
   Status status;
+
+  // data block
+  // 真正存放key/value的地方
   BlockBuilder data_block;
+
+  // 用来记录data block index的block
   BlockBuilder index_block;
+
+  // 记录最后添加的key
+  // 每个新来的key要进来的时候，都要与这个key进行比较，进而保证
+  // 整体的顺序是有序的
   std::string last_key;
+
+  // 总共的条目数
   int64_t num_entries;
+
+  // 是否关闭了
   bool closed;  // Either Finish() or Abandon() has been called.
+
+  // meta block
+  // 由于meta block只有一个
+  // 所以当写完meta block之后
+  // 立即可以写入meta block index块
+  // 这也就是为什么没有meta block index的原因。
   FilterBlockBuilder* filter_block;
 
   // We do not emit the index entry for a block until we have seen the

@@ -766,19 +766,32 @@ class VersionSet::Builder {
 VersionSet::VersionSet(const std::string& dbname, const Options* options,
                        TableCache* table_cache,
                        const InternalKeyComparator* cmp)
-    : env_(options->env),
+    : 
+      // 设置一些基本参数
+      env_(options->env),
       dbname_(dbname),
       options_(options),
+      // 设置 table_cache_
       table_cache_(table_cache),
       icmp_(*cmp),
+      // 接下来文件的编号
+      // 这里使用了新生成的DB的编号
       next_file_number_(2),
+      // 这里只是简单地初始化为0
+      // 实际上在新生成DB的时候，编号已经是1了
       manifest_file_number_(0),  // Filled by Recover()
+      // 用户 insert key/value 的时候会使用的 seq
       last_sequence_(0),
+      // WAL 日志文件使用的编号 0
       log_number_(0),
+      // 前一个 WAL 日志文件的编号
       prev_log_number_(0),
       descriptor_file_(nullptr),
       descriptor_log_(nullptr),
+
+      // VersionSet 中的双向链表表头
       dummy_versions_(this),
+      // 指向当前 Version
       current_(nullptr) {
   // 构造时，CURRENT 一开始指向了 NULL
   // 此时 append 一个新的 Version，相应地更新 CURRENT

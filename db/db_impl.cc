@@ -91,27 +91,52 @@ static void ClipToRange(T* ptr, V minvalue, V maxvalue) {
   if (static_cast<V>(*ptr) > maxvalue) *ptr = maxvalue;
   if (static_cast<V>(*ptr) < minvalue) *ptr = minvalue;
 }
+
+/*
+ * 修改option里面的各种设定：
+ * 1. 修改参数范围
+ * 2. 设置info_log
+ * 3. 设置block_cache
+ */
 Options SanitizeOptions(const std::string& dbname,
                         const InternalKeyComparator* icmp,
                         const InternalFilterPolicy* ipolicy,
                         const Options& src) {
+  // 基于传进来的 option
   Options result = src;
+  // 设置 key 比较器
   result.comparator = icmp;
+  // 过滤器
   result.filter_policy = (src.filter_policy != nullptr) ? ipolicy : nullptr;
+  // 这里是把参数归一化，过大的数放到max_value
+  // 太小的数放到min_value
+  // 介于最大和最小之间的不做处理
   ClipToRange(&result.max_open_files, 64 + kNumNonTableCacheFiles, 50000);
   ClipToRange(&result.write_buffer_size, 64 << 10, 1 << 30);
   ClipToRange(&result.max_file_size, 1 << 20, 1 << 30);
   ClipToRange(&result.block_size, 1 << 10, 4 << 20);
+
+  // 中间操作记录，出错信息等等
+  // 会把中间步骤与信息都写到这个文件里面
+  // 这个文件放置的位置是dbname/info_log
   if (result.info_log == nullptr) {
+    // 如果还没有日志指针，那么创建相应的目录
     // Open a log file in the same directory as the db
     src.env->CreateDir(dbname);  // In case it does not exist
+    // 把原来的LOG文件重命名
     src.env->RenameFile(InfoLogFileName(dbname), OldInfoLogFileName(dbname));
+    // 生成新的LOG文件
     Status s = src.env->NewLogger(InfoLogFileName(dbname), &result.info_log);
     if (!s.ok()) {
       // No place suitable for logging
       result.info_log = nullptr;
     }
   }
+  // 如果没有block_cache
+  // block_cache就是用来存放sst文件里面的block数据部分
+  // table_cache是用来存放sst文件里面的index cache部分
+  // 这里并没有设置table_cache，后面可以看一下
+  // table_cache是在哪里处理的。
   if (result.block_cache == nullptr) {
     result.block_cache = NewLRUCache(8 << 20);
   }
@@ -124,28 +149,51 @@ static int TableCacheSize(const Options& sanitized_options) {
 }
 
 DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
-    : env_(raw_options.env),
+    : 
+      // 初始化环境变量
+      env_(raw_options.env),
+      // 初始化 key 比较器
       internal_comparator_(raw_options.comparator),
+      // 初始化过滤策略
       internal_filter_policy_(raw_options.filter_policy),
+
+      // 设置 option
       options_(SanitizeOptions(dbname, &internal_comparator_,
                                &internal_filter_policy_, raw_options)),
+      // 是否有 info_log
       owns_info_log_(options_.info_log != raw_options.info_log),
+      // 是否有option中的cache.
       owns_cache_(options_.block_cache != raw_options.block_cache),
+      // 数据库名字
       dbname_(dbname),
+      // table_cache指的是sst文件的index部分的cache，此处 new 了一个
       table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
+      // 数据库的锁
       db_lock_(nullptr),
+      // 是否关闭
       shutting_down_(false),
+      // 后台线程信号
       background_work_finished_signal_(&mutex_),
+      // 活跃的mem
       mem_(nullptr),
+      // 不能修改的mem
       imm_(nullptr),
       has_imm_(false),
+      // WAL journal文件句柄，类似于FILE指针
       logfile_(nullptr),
+      // WAL 文件序号
       logfile_number_(0),
+      // WAL文件 writer
       log_(nullptr),
+      // 随机数种子
       seed_(0),
+      // 临时批量写
       tmp_batch_(new WriteBatch),
+      // 后台合并调度
       background_compaction_scheduled_(false),
+      // 手动合并
       manual_compaction_(nullptr),
+      // 生成一个空的版本对象
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)) {}
 
@@ -179,23 +227,41 @@ DBImpl::~DBImpl() {
 }
 
 Status DBImpl::NewDB() {
+
+  // 生成一个空的版本编辑器
   VersionEdit new_db;
+  // 设置比较器 name
   new_db.SetComparatorName(user_comparator()->Name());
+  // 设置WAL编号: 也就是说WAL log把编号0占用了
   new_db.SetLogNumber(0);
+  // 设置接下来的文件编号
+  // 接下来新的文件会使用编号2
+  // 那么中间的1呢？下面可以看到1是被Manifest文件看到了。
   new_db.SetNextFile(2);
+  // 用户提交key/value时的编号
   new_db.SetLastSequence(0);
 
+  // manifest文件的编号，这里新生成的DB里面把1占用掉了。
   const std::string manifest = DescriptorFileName(dbname_, 1);
+
+  // 接下来把这个生成新DB的操作通过写WAL日志的方式
+  // 写到manifest文件中
   WritableFile* file;
+  // manifest文件也是一个WAL文件
+  // 这里是生成相应的文件句柄
   Status s = env_->NewWritableFile(manifest, &file);
   if (!s.ok()) {
     return s;
   }
+  // 把生成DB的操作写入到manifest文件中
   {
     log::Writer log(file);
     std::string record;
+    // 序列化成日志记录
     new_db.EncodeTo(&record);
+    // 将日志记录添加到日志文件中，MANIFEST 中
     s = log.AddRecord(record);
+    // 执行一次 sync，保证成功刷回
     if (s.ok()) {
       s = file->Sync();
     }
@@ -205,11 +271,14 @@ Status DBImpl::NewDB() {
   }
   delete file;
   if (s.ok()) {
+    // 如果写入成功，那么将CURRENT文件指向当前的新的manifest文件
     // Make "CURRENT" file that points to the new manifest file.
     s = SetCurrentFile(env_, dbname_, 1);
   } else {
+    // 写入失败就取消这个记录，删除这个文件
     env_->RemoveFile(manifest);
   }
+  // 相应地返回创建 DB 的状态
   return s;
 }
 
@@ -299,9 +368,13 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   // may already exist from a previous failed creation attempt.
   // 创建数据库目录
   env_->CreateDir(dbname_);
+  // 因为刚创建DB
+  // DB相关的文件锁肯定还不存在
   assert(db_lock_ == nullptr);
   // 加文件锁，防止其他进程进入
   Status s = env_->LockFile(LockFileName(dbname_), &db_lock_);
+  // 如果失败，或者已经被上锁，说明已经有人在使用DB了
+  // 直接退出
   if (!s.ok()) {
     return s;
   }
@@ -315,16 +388,21 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
       Log(options_.info_log, "Creating DB %s since it was missing.",
           dbname_.c_str());
 
-      // 新创建一个数据库
+      // 如果不存在，且配置了该选项，则新创建一个数据库
       s = NewDB();
       if (!s.ok()) {
         return s;
       }
+      // 否则报错
     } else {
       return Status::InvalidArgument(
           dbname_, "does not exist (create_if_missing is false)");
     }
   } else {
+
+    // 如果CURRENT文件已经存在，说明DB已经存在
+    // 根据option来决定是否要报错 
+    // error_if_exists 选项表明如果数据库存在，就要报错
     if (options_.error_if_exists) {
       return Status::InvalidArgument(dbname_,
                                      "exists (error_if_exists is true)");
@@ -1599,7 +1677,7 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   }
   if (s.ok() && save_manifest) {
     // 如果需要重写MANIFEST文件，那么做一个版本变更，这里面会创建一个新的MANIFEST
-    // 将当前的版本信息写入，然后将edit的内容写入。   
+    // 将当前的版本信息写入，然后将edit的内容写入。应用新版本   
     edit.SetPrevLogNumber(0);  // No older logs needed after recovery.
     edit.SetLogNumber(impl->logfile_number_);
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
